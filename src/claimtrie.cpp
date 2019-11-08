@@ -345,7 +345,7 @@ std::size_t CClaimTrieCacheBase::getTotalClaimsInTrie() const
 CAmount CClaimTrieCacheBase::getTotalValueOfClaimsInTrie(bool fControllingOnly) const
 {
     CAmount ret = 0;
-    std::string query("SELECT TOTAL(SELECT TOTAL(s.amount)+c.amount FROM supports s "
+    std::string query("SELECT SUM(SELECT IFNULL(SUM(s.amount),0)+c.amount FROM supports s "
                       "WHERE s.supportedClaimID = c.claimID AND s.validHeight < ?1 AND s.expirationHeight >= ?1) "
                       "FROM claims c WHERE c.validHeight < ?1 AND s.expirationHeight >= ?1");
     if (fControllingOnly)
@@ -526,8 +526,8 @@ CClaimTrieCacheBase::CClaimTrieCacheBase(CClaimTrie* base)
     : base(base), db(base->dbPath, sharedConfig), transacting(false),
       childHashQuery(db << "SELECT name, hash, IFNULL(takeoverHeight, 0) FROM nodes WHERE parent = ? ORDER BY name"),
       claimHashQuery(db << "SELECT c.txID, c.txN, c.claimID, c.blockHeight, c.validHeight, c.amount, "
-                              "(SELECT TOTAL(s.amount)+c.amount FROM supports s WHERE s.supportedClaimID = c.claimID "
-                              "AND s.validHeight < ?1 AND s.expirationHeight >= ?1) as effectiveAmount "
+                              "(SELECT IFNULL(SUM(s.amount),0)+c.amount FROM supports s WHERE s.supportedClaimID = c.claimID "
+                              "AND s.nodeName = c.nodeName AND s.validHeight < ?1 AND s.expirationHeight >= ?1) as effectiveAmount "
                               "FROM claims c WHERE c.nodeName = ?2 AND c.validHeight < ?1 AND c.expirationHeight >= ?1 "
                               "ORDER BY effectiveAmount DESC, c.blockHeight, c.txID, c.txN")
 {
