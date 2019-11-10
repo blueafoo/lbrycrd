@@ -180,36 +180,56 @@ struct vector_builder : public std::vector<Target> {
     };
 };
 
-bool CClaimTrieCacheBase::deleteNodeIfPossible(const std::string& name, std::string& parent, std::vector<std::string>& claims) {
+bool deleteNodeIfPossible(sqlite::database& db, const std::string& name, std::string& parent, std::string& child, int height) {
     if (name.empty()) return false;
     // to remove a node it must have one or less children and no claims
-    vector_builder<std::string, std::string> claimsBuilder;
-    db << "SELECT name FROM claims WHERE nodeName = ?1 AND validHeight < ?2 AND expirationHeight >= ?2 "
-              << name << nNextHeight >> claimsBuilder;
-    claims = std::move(claimsBuilder);
-    if (!claims.empty()) return false; // still has claims
+    int64_t claimCount;
+    db << "SELECT COUNT(*) FROM claims WHERE nodeName = ?1 AND validHeight < ?2 AND expirationHeight >= ?2 "
+              << name << height >> claimCount;
+    if (claimCount > 0) return false; // still has claims
     // we now know it has no claims, but we need to check its children
     int64_t count;
-    std::string childName;
-    // this line assumes that we've set the parent on child nodes already,
-    // which means we are len(name) desc in our parent method
-    // alternately: SELECT COUNT(DISTINCT nodeName) FROM claims WHERE SUBSTR(nodeName, 1, len(?)) == ? AND LENGTH(nodeName) > len(?)
-    db << "SELECT COUNT(*),MAX(name) FROM nodes WHERE parent = ?" << name >> std::tie(count, childName);
+    db << "SELECT COUNT(DISTINCT nodeName), MAX(nodeName) FROM claims WHERE SUBSTR(nodeName, 1, ?1) == ?2 "
+          "AND validHeight < ?3 AND expirationHeight >= ?3"
+          << name.size() << name << height >> std::tie(count, child); // already know that exact nodeName matches are 0
     if (count > 1) return false; // still has multiple children
+    if (count < 1) child.clear();
     LogPrint(BCLog::CLAIMS, "Removing node %s with %d children\n", name, count);
     // okay. it's going away
     auto query = db << "SELECT parent FROM nodes WHERE name = ?" << name;
     auto it = query.begin();
-    if (it == query.end())
+    if (it == query.end()) {
+        parent.clear();
         return true; // we'll assume that whoever deleted this node previously cleaned things up correctly
+    }
     *it >> parent;
     db << "DELETE FROM nodes WHERE name = ?" << name;
     auto ret = db.rows_modified() > 0;
-    if (ret && count == 1) // make the child skip us and point to its grandparent:
-        db << "UPDATE nodes SET parent = ? WHERE name = ?" << parent << childName;
-    if (ret)
+    if (ret && !parent.empty())
         db << "UPDATE nodes SET hash = NULL WHERE name = ?" << parent;
     return ret;
+}
+
+std::string findTrueParent(sqlite::database& db, std::string parent, int height) {
+    // we need a node where there is a claim
+    // or where there are at least two claims that start with "parent" but differ on the char after
+    auto pquery = db << "SELECT DISTINCT nodeName FROM claims WHERE SUBSTR(nodeName, 1, ?1) = ?2 "
+                        "AND validHeight < ?3 AND expirationHeight >= ?3";
+    while (!parent.empty()) {
+        parent.pop_back();
+        std::string prev;
+        for (auto &&row: pquery << parent.size() << parent << height) {
+            std::string hit;
+            row >> hit;
+            if (hit == parent)
+                return parent;
+            if (!prev.empty() && prev[parent.size()] != hit[parent.size()])
+                return parent;
+            prev = hit;
+        }
+        pquery++;
+    }
+    return parent;
 }
 
 void CClaimTrieCacheBase::ensureTreeStructureIsUpToDate() {
@@ -222,107 +242,67 @@ void CClaimTrieCacheBase::ensureTreeStructureIsUpToDate() {
     // those each have a corresponding node in the list with a null hash
     // some of our nodes will go away, some new ones will be added, some will be reparented
 
-
-    // the plan: update all the claim hashes first
+    // the plan: update all the claim hash  es first
     vector_builder<std::string, std::string> names;
     db << "SELECT name FROM nodes WHERE hash IS NULL ORDER BY LENGTH(name) DESC, name DESC" >> names;
     if (names.empty()) return; // nothing to do
 
     // there's an assumption that all nodes with claims are here; we do that as claims are inserted
-
-    // assume parents are not set correctly here:
-    auto parentQuery = db << "SELECT name FROM nodes WHERE "
-                              "name IN (WITH RECURSIVE prefix(p) AS (VALUES(?) UNION ALL "
-                              "SELECT SUBSTR(p, 1, LENGTH(p)-1) FROM prefix WHERE p != '') SELECT p FROM prefix) "
-                              "ORDER BY name DESC LIMIT 1";
+    // we also assume that we never need to remove a node for some cause other than removal of one of its children nodes
+    // assume parents are not set correctly here
 
     auto insertQuery = db << "INSERT INTO nodes(name, parent, hash) VALUES(?, ?, NULL) "
                              "ON CONFLICT(name) DO UPDATE SET parent = excluded.parent, hash = NULL";
 
     auto updateUnaffectedsQuery = db << "UPDATE nodes SET parent = ? WHERE name LIKE ? AND LENGTH(parent) < ?";
 
-
-    for (auto& name: names) {
-        std::vector<std::string> claims;
-        std::string parent;
-        if (deleteNodeIfPossible(name, parent, claims)) {
-            std::string grandparent;
-            deleteNodeIfPossible(parent, grandparent, claims);
-            continue;
+    for (auto i = 0U; i < names.size(); ++i) {
+        auto name = names[i];
+        std::string parent, child;
+        if (deleteNodeIfPossible(db, name, parent, child, nNextHeight)) {
+            if (!parent.empty())
+                names.push_back(parent);
+            name = child;
         }
-        if (name.empty() || claims.empty())
-            continue; // if you have no claims but we couldn't delete you, you must have legitimate children
 
-        parentQuery << name.substr(0, name.size() - 1);
-        auto queryIt = parentQuery.begin();
-        if (queryIt != parentQuery.end())
-            *queryIt >> parent;
-        else
-            parent.clear();
-        parentQuery++; // reusing knocks off about 10% of the query time
+        // find the real parent name:
+        while(!name.empty()) {
+            parent = findTrueParent(db, name, nNextHeight);
 
-        // we know now that we need to insert it,
-        // but we may need to insert a parent node for it first (also called a split)
-        vector_builder<std::string, std::string> siblings;
-        db << "SELECT name FROM nodes WHERE parent = ?" << parent >> siblings;
-        std::size_t splitPos = 0;
-        for (auto& sibling: siblings) {
-            if (sibling[parent.size()] == name[parent.size()]) {
-                splitPos = parent.size() + 1;
-                while(splitPos < sibling.size() && splitPos < name.size() && sibling[splitPos] == name[splitPos])
-                    ++splitPos;
-                auto newNodeName = name.substr(0, splitPos);
-                // notify new node's parent:
-                db << "UPDATE nodes SET hash = NULL WHERE name = ?" << parent;
-                // and his sibling:
-                db << "UPDATE nodes SET parent = ? WHERE name = ?" << newNodeName << sibling;
-                if (splitPos == name.size()) {
-                    // our new node is the same as the one we wanted to insert
-                    break;
-                }
-                // insert the split node:
-                LogPrint(BCLog::CLAIMS, "Inserting split node %s near %s, parent %s\n", newNodeName, sibling, parent);
-                insertQuery << newNodeName << parent;
-                insertQuery++;
-
-                if (newNodeName.find('_') == std::string::npos && newNodeName.find('%') == std::string::npos) {
-                    updateUnaffectedsQuery << newNodeName << newNodeName + "_%" << newNodeName.size();
-                    updateUnaffectedsQuery++;
-                }
-                else
-                    db << "UPDATE nodes SET parent = ?1 WHERE SUBSTR(name, 1, ?2) = ?1 AND LENGTH(parent) < ?2 AND name != ?1"
-                       << newNodeName << newNodeName.size();
-
-
-                parent = std::move(newNodeName);
-                break;
+            auto pq = db << "SELECT parent FROM nodes WHERE name = ? AND parent != ?" << name << parent;
+            auto pqit = pq.begin();
+            if (pqit != pq.end()) {
+                names.emplace_back();
+                *pqit >> names.back();
             }
-        }
 
-        LogPrint(BCLog::CLAIMS, "Inserting or updating node %s, parent %s\n", name, parent);
-        insertQuery << name << parent;
-        insertQuery++;
-        if (splitPos == 0)
-            db << "UPDATE nodes SET hash = NULL WHERE name = ?" << parent;
+            LogPrint(BCLog::CLAIMS, "Inserting or updating node %s, parent %s\n", name, parent);
+            insertQuery << name << parent;
+            insertQuery++;
 
-        if (name.find('_') == std::string::npos && name.find('%') == std::string::npos) {
-            updateUnaffectedsQuery << name << name + "_%" << name.size();
-            updateUnaffectedsQuery++;
+            if (name.find('_') == std::string::npos && name.find('%') == std::string::npos) {
+                updateUnaffectedsQuery << name << name + "_%" << name.size();
+                updateUnaffectedsQuery++;
+            }
+            else
+                db << "UPDATE nodes SET parent = ?1 WHERE SUBSTR(name, 1, ?2) = ?1 AND LENGTH(parent) < ?2 AND name != ?1"
+                   << name << name.size();
+
+            name = parent;
         }
-        else
-            db << "UPDATE nodes SET parent = ?1 WHERE SUBSTR(name, 1, ?2) = ?1 AND LENGTH(parent) < ?2 AND name != ?1"
-                << name << name.size();
     }
 
-    parentQuery.used(true);
     insertQuery.used(true);
     updateUnaffectedsQuery.used(true);
 
+    if (!names.empty())
+        db << "UPDATE nodes SET hash = NULL WHERE name = ''";
+
     // now we need to percolate the nulls up the tree
     // parents should all be set right
-    db << "UPDATE nodes SET hash = NULL WHERE name IN (WITH RECURSIVE prefix(p) AS "
-          "(SELECT parent FROM nodes WHERE hash IS NULL UNION SELECT parent FROM prefix, nodes "
-          "WHERE name = prefix.p AND prefix.p IS NOT NULL ORDER BY parent DESC) SELECT p FROM prefix)";
+//        db << "UPDATE nodes SET hash = NULL WHERE name IN (WITH RECURSIVE prefix(p) AS "
+//              "(SELECT parent FROM nodes WHERE hash IS NULL UNION SELECT parent FROM prefix, nodes "
+//              "WHERE name = prefix.p AND prefix.p IS NOT NULL ORDER BY parent DESC) SELECT p FROM prefix)";
 }
 
 std::size_t CClaimTrieCacheBase::getTotalNamesInTrie() const
@@ -616,7 +596,7 @@ bool CClaimTrieCacheBase::addSupport(const std::string& name, const COutPoint& o
     return true;
 }
 
-    bool CClaimTrieCacheBase::removeClaim(const uint160& claimId, const COutPoint& outPoint, std::string& nodeName, int& validHeight)
+bool CClaimTrieCacheBase::removeClaim(const uint160& claimId, const COutPoint& outPoint, std::string& nodeName, int& validHeight)
 {
     if (!transacting) { transacting = true; db << "begin"; }
 

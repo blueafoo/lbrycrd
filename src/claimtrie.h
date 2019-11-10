@@ -391,8 +391,6 @@ protected:
     supportEntryType getSupportsForName(const std::string& name) const;
 
     virtual int getDelayForName(const std::string& name, const uint160& claimId) const;
-
-    bool deleteNodeIfPossible(const std::string& name, std::string& parent, std::vector<std::string>& claims);
     void ensureTreeStructureIsUpToDate();
 
 private:
