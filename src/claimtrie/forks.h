@@ -66,9 +66,27 @@ public:
     bool allowSupportMetadata() const;
 
 protected:
-    uint256 computeNodeHash(const std::string& name, int takeoverHeight) override;
+    virtual std::vector<uint256> childrenHashes(const std::string& name,
+                                                const std::function<void(const std::string&)>& callback = {});
+    virtual std::vector<uint256> claimsHashes(const std::string& name, int takeoverHeight,
+                                              const std::function<void(const CClaimInfo&)>& callback = {});
+    uint256 computeNodeHash(const std::string& name, int takeoverHeight, int children) override;
 };
 
-typedef CClaimTrieCacheHashFork CClaimTrieCache;
+class CClaimTrieCacheClaimInfoHashFork : public CClaimTrieCacheHashFork
+{
+public:
+    explicit CClaimTrieCacheClaimInfoHashFork(CClaimTrie* base);
+    CClaimTrieCacheClaimInfoHashFork(CClaimTrieCacheClaimInfoHashFork&&) = default;
+
+    void initializeIncrement() override;
+    bool finalizeDecrement() override;
+
+protected:
+    std::vector<uint256> claimsHashes(const std::string& name, int takeoverHeight,
+                                      const std::function<void(const CClaimInfo&)>& callback = {}) override;
+};
+
+typedef CClaimTrieCacheClaimInfoHashFork CClaimTrieCache;
 
 #endif // CLAIMTRIE_FORKS_H

@@ -18,18 +18,23 @@ uint256 getValueHash(const COutPoint& outPoint, int nHeightOfLastTakeover);
 
 class CClaimTrie
 {
+    // for unit tests
     friend class CClaimTrieCacheBase;
     friend class ClaimTrieChainFixture;
+    friend class ValidationBlockTests;
+
+    // forks have to be friends of trie
     friend class CClaimTrieCacheHashFork;
     friend class CClaimTrieCacheExpirationFork;
     friend class CClaimTrieCacheNormalizationFork;
-    friend class ValidationBlockTests;
+    friend class CClaimTrieCacheClaimInfoHashFork;
 
 public:
     CClaimTrie() = delete;
     CClaimTrie(CClaimTrie&&) = delete;
     CClaimTrie(const CClaimTrie&) = delete;
-    CClaimTrie(std::size_t cacheBytes, bool fWipe, int height = 0,
+    CClaimTrie(std::size_t cacheBytes,
+               bool fWipe, int height = 0,
                const std::string& dataDir = ".",
                int nNormalizedNameForkHeight = 1,
                int nMinRemovalWorkaroundHeight = 1,
@@ -38,6 +43,7 @@ public:
                int64_t nExtendedClaimExpirationTime = 1,
                int64_t nExtendedClaimExpirationForkHeight = 1,
                int64_t nAllClaimsInMerkleForkHeight = 1,
+               int64_t nClaimInfoInMerkleForkHeight = 1,
                int proportionalDelayFactor = 32);
 
     CClaimTrie& operator=(CClaimTrie&&) = delete;
@@ -61,6 +67,7 @@ protected:
     const int64_t nExtendedClaimExpirationTime;
     const int64_t nExtendedClaimExpirationForkHeight;
     const int64_t nAllClaimsInMerkleForkHeight;
+    const int64_t nClaimInfoInMerkleForkHeight;
 };
 
 class CClaimTrieCacheBase
@@ -93,7 +100,7 @@ public:
                     int nHeight, int nValidHeight = -1);
 
     bool removeClaim(const uint160& claimId, const COutPoint& outPoint, std::string& nodeName,
-            int& validHeight, int& originalHeight);
+                     int& validHeight, int& originalHeight);
     bool removeSupport(const COutPoint& outPoint, std::string& nodeName, int& validHeight);
 
     virtual bool incrementBlock();
@@ -121,10 +128,9 @@ protected:
     int nNextHeight; // Height of the block that is being worked on, which is
     CClaimTrie* base;
     sqlite::database db;
-    mutable std::unordered_set<std::string> removalWorkaround;
     sqlite::database_binder childHashQuery, claimHashQuery, claimHashQueryLimit;
 
-    virtual uint256 computeNodeHash(const std::string& name, int takeoverHeight);
+    virtual uint256 computeNodeHash(const std::string& name, int takeoverHeight, int children);
     supportEntryType getSupportsForName(const std::string& name) const;
 
     virtual int getDelayForName(const std::string& name, const uint160& claimId) const;
@@ -132,10 +138,12 @@ protected:
     bool deleteNodeIfPossible(const std::string& name, std::string& parent, int64_t& claims);
     void ensureTreeStructureIsUpToDate();
     void ensureTransacting();
-    void insertTakeovers(bool allowReplace=false);
+    void insertTakeovers(bool allowReplace = false);
 
 private:
     bool transacting;
+    mutable std::unordered_set<std::string> removalWorkaround;
+
     // for unit test
     friend struct ClaimTrieChainFixture;
     friend class CClaimTrieCacheTest;

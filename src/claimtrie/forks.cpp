@@ -4,6 +4,10 @@
 #include <log.h>
 #include <trie.h>
 
+#include <iomanip>
+#include <sstream>
+#include <string>
+
 #include <boost/locale.hpp>
 #include <boost/locale/conversion.hpp>
 #include <boost/locale/localization_backend.hpp>
@@ -243,26 +247,53 @@ uint256 ComputeMerkleRoot(std::vector<uint256> hashes)
     return hashes.empty() ? uint256{} : hashes[0];
 }
 
-uint256 CClaimTrieCacheHashFork::computeNodeHash(const std::string& name, int takeoverHeight)
+std::vector<uint256> CClaimTrieCacheHashFork::childrenHashes(const std::string& name, const std::function<void(const std::string&)>& callback)
+{
+    std::vector<uint256> childHashes;
+    for (auto&& row: childHashQuery << name) {
+        if (callback) {
+            std::string childName;
+            row >> childName;
+            callback(childName);
+        } else
+            /* name */ row.index()++;
+        row >> *childHashes.emplace(childHashes.end());
+    }
+    childHashQuery++;
+    return childHashes;
+}
+
+std::vector<uint256> CClaimTrieCacheHashFork::claimsHashes(const std::string& name, int takeoverHeight, const std::function<void(const CClaimInfo&)>& callback)
+{
+    CClaimInfo info;
+    std::vector<uint256> claimHashes;
+    for (auto&& row: claimHashQuery << nNextHeight << name) {
+        row >> info.outPoint.hash >> info.outPoint.n;
+        if (callback) {
+            row >> info.claimId >> info.updateHeight;
+            // activationHeight, amount
+            row.index() += 2;
+            row >> info.originalHeight;
+            callback(info);
+        }
+        claimHashes.push_back(getValueHash(info.outPoint, takeoverHeight));
+    }
+    claimHashQuery++;
+    return claimHashes;
+}
+
+uint256 CClaimTrieCacheHashFork::computeNodeHash(const std::string& name, int takeoverHeight, int children)
 {
     if (nNextHeight < base->nAllClaimsInMerkleForkHeight)
-        return CClaimTrieCacheNormalizationFork::computeNodeHash(name, takeoverHeight);
+        return CClaimTrieCacheNormalizationFork::computeNodeHash(name, takeoverHeight, children);
 
     std::vector<uint256> childHashes;
-    childHashQuery << name >> [&childHashes](std::string, uint256 hash) {
-        childHashes.push_back(std::move(hash));
-    };
-    childHashQuery++;
+    if (children > 0)
+        childHashes = childrenHashes(name);
 
     std::vector<uint256> claimHashes;
-    if (takeoverHeight > 0) {
-        COutPoint p;
-        for (auto &&row: claimHashQuery << nNextHeight << name) {
-            row >> p.hash >> p.n;
-            claimHashes.push_back(getValueHash(p, takeoverHeight));
-        }
-        claimHashQuery++;
-    }
+    if (takeoverHeight > 0)
+        claimHashes = claimsHashes(name, takeoverHeight);
 
     if (childHashes.empty() && claimHashes.empty())
         return verifyEmptyTrie(name);
@@ -330,10 +361,10 @@ std::vector<uint256> ComputeMerklePath(const std::vector<uint256>& hashes, uint3
 
 extern const std::string proofClaimQuery_s;
 
-bool CClaimTrieCacheHashFork::getProofForName(const std::string& name, const uint160& claim, CClaimTrieProof& proof)
+bool CClaimTrieCacheHashFork::getProofForName(const std::string& name, const uint160& claimId, CClaimTrieProof& proof)
 {
     if (nNextHeight < base->nAllClaimsInMerkleForkHeight)
-        return CClaimTrieCacheNormalizationFork::getProofForName(name, claim, proof);
+        return CClaimTrieCacheNormalizationFork::getProofForName(name, claimId, proof);
 
     auto fillPairs = [&proof](const std::vector<uint256>& hashes, uint32_t idx) {
         auto partials = ComputeMerklePath(hashes, idx);
@@ -348,32 +379,23 @@ bool CClaimTrieCacheHashFork::getProofForName(const std::string& name, const uin
         std::string key;
         int takeoverHeight;
         row >> key >> takeoverHeight;
-        uint32_t nextCurrentIdx = 0;
-        std::vector<uint256> childHashes;
-        for (auto&& child : childHashQuery << key) {
-            std::string childKey;
-            uint256 childHash;
-            child >> childKey >> childHash;
-            if (name.find(childKey) == 0)
-                nextCurrentIdx = uint32_t(childHashes.size());
-            childHashes.push_back(childHash);
-        }
-        childHashQuery++;
 
-        std::vector<uint256> claimHashes;
-        uint32_t claimIdx = 0;
-        for (auto&& child: claimHashQuery << nNextHeight << key) {
-            COutPoint childOutPoint;
-            uint160 childClaimID;
-            child >> childOutPoint.hash >> childOutPoint.n >> childClaimID;
-            if (childClaimID == claim && key == name) {
-                claimIdx = uint32_t(claimHashes.size());
-                proof.outPoint = childOutPoint;
+        uint32_t childIdx = 0, idx = 0;
+        auto childHashes = childrenHashes(key, [&](const std::string& childKey) {
+            if (name.find(childKey) == 0)
+                childIdx = idx;
+            ++idx;
+        });
+
+        uint32_t claimIdx = 0; idx = 0;
+        auto claimHashes = claimsHashes(key, takeoverHeight, [&](const CClaimInfo& info) {
+            if (key == name && info.claimId == claimId) {
+                claimIdx = idx;
                 proof.hasValue = true;
+                proof.outPoint = info.outPoint;
             }
-            claimHashes.push_back(getValueHash(childOutPoint, takeoverHeight));
-        }
-        claimHashQuery++;
+            ++idx;
+        });
 
         // I am on a node; I need a hash(children, claims)
         // if I am the last node on the list, it will be hash(children, x)
@@ -388,7 +410,7 @@ bool CClaimTrieCacheHashFork::getProofForName(const std::string& name, const uin
             auto hash = claimHashes.empty() ? emptyHash : ComputeMerkleRoot(std::move(claimHashes));
             proof.pairs.emplace_back(false, hash);
             if (!childHashes.empty())
-                fillPairs(childHashes, nextCurrentIdx);
+                fillPairs(childHashes, childIdx);
         }
     }
     std::reverse(proof.pairs.begin(), proof.pairs.end());
@@ -418,4 +440,72 @@ bool CClaimTrieCacheHashFork::finalizeDecrement()
 bool CClaimTrieCacheHashFork::allowSupportMetadata() const
 {
     return nNextHeight >= base->nAllClaimsInMerkleForkHeight;
+}
+
+CClaimTrieCacheClaimInfoHashFork::CClaimTrieCacheClaimInfoHashFork(CClaimTrie* base) : CClaimTrieCacheHashFork(base)
+{
+}
+
+extern std::vector<unsigned char> heightToVch(int n);
+
+// NOTE: the name is supposed to be the final one
+// normalized or not is the caller responsibility
+uint256 claimInfoHash(const std::string& name, const COutPoint& outPoint, int bid, int seq, int nHeightOfLastTakeover)
+{
+    auto hash = Hash2(Hash(name), Hash(outPoint.hash));
+    hash = Hash2(hash, std::to_string(outPoint.n));
+    hash = Hash2(hash, std::to_string(bid));
+    hash = Hash2(hash, std::to_string(seq));
+    return Hash2(hash, heightToVch(nHeightOfLastTakeover));
+}
+
+inline std::size_t indexOf(const std::vector<CClaimInfo>& infos, const CClaimInfo& info)
+{
+    return std::distance(infos.begin(), std::find(infos.begin(), infos.end(), info));
+}
+
+std::vector<uint256> CClaimTrieCacheClaimInfoHashFork::claimsHashes(const std::string& name, int takeoverHeight, const std::function<void(const CClaimInfo&)>& callback)
+{
+    if (nNextHeight < base->nClaimInfoInMerkleForkHeight)
+        return CClaimTrieCacheHashFork::claimsHashes(name, takeoverHeight, callback);
+
+    std::vector<CClaimInfo> claimsByBid;
+    for (auto&& row: claimHashQuery << nNextHeight << name) {
+        auto& cb = *claimsByBid.emplace(claimsByBid.end());
+        row >> cb.outPoint.hash >> cb.outPoint.n >> cb.claimId >> cb.updateHeight;
+        // activationHeight, amount
+        row.index() += 2;
+        row >> cb.originalHeight;
+        if (callback) callback(cb);
+    }
+    claimHashQuery++;
+
+    auto claimsBySeq = claimsByBid;
+    std::sort(claimsBySeq.begin(), claimsBySeq.end());
+    std::vector<uint256> claimsHashes;
+    for (auto i = 0u; i < claimsByBid.size(); ++i) {
+        auto& cb = claimsByBid[i];
+        claimsHashes.push_back(claimInfoHash(name, cb.outPoint, i, indexOf(claimsBySeq, cb), takeoverHeight));
+    }
+    return claimsHashes;
+}
+
+void CClaimTrieCacheClaimInfoHashFork::initializeIncrement()
+{
+    CClaimTrieCacheHashFork::initializeIncrement();
+    // we could do this in the constructor, but that would not allow for multiple increments in a row (as done in unit tests)
+    if (nNextHeight == base->nClaimInfoInMerkleForkHeight - 1) {
+        ensureTransacting();
+        db << "UPDATE node SET hash = NULL";
+    }
+}
+
+bool CClaimTrieCacheClaimInfoHashFork::finalizeDecrement()
+{
+    auto ret = CClaimTrieCacheHashFork::finalizeDecrement();
+    if (ret && nNextHeight == base->nClaimInfoInMerkleForkHeight - 1) {
+        ensureTransacting();
+        db << "UPDATE node SET hash = NULL";
+    }
+    return ret;
 }
