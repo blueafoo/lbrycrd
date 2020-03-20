@@ -347,17 +347,24 @@ public:
     {
         return MakeUnique<NotificationsHandlerImpl>(*this, notifications);
     }
-    bool waitForNotificationsIfTipIsNotSame(const uint256& tip) override
+    void waitForNotificationsAndTip(std::function<uint256(void)> getCurrent) override
     {
-        if (!tip.IsNull()) {
-            LOCK(::cs_main);
-            auto chainTip = ::ChainActive().Tip();
-            if (tip == chainTip->GetBlockHash()) return true;
-            CBlockIndex* block = LookupBlockIndex(tip);
-            if (block && block->GetAncestor(::ChainActive().Height()) == chainTip) return true;
+        while (true) {
+            auto current = getCurrent();
+            if (current.IsNull())
+                break;
+            {
+                LOCK(::cs_main);
+                auto target = ::ChainActive().Tip();
+                if (current == target->hash)
+                    break;
+                CBlockIndex *block = LookupBlockIndex(current);
+                if (block && block->nHeight > target->nHeight && block->GetAncestor(target->nHeight) == target)
+                    break;
+            }
+            MilliSleep(100);
         }
         SyncWithValidationInterfaceQueue();
-        return false;
     }
     std::unique_ptr<Handler> handleRpc(const CRPCCommand& command) override
     {

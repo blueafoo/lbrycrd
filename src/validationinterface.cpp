@@ -121,12 +121,14 @@ void CallFunctionInValidationInterfaceQueue(std::function<void ()> func) {
 
 void SyncWithValidationInterfaceQueue() {
     AssertLockNotHeld(cs_main);
-    // Block until the validation queue drains
-    std::promise<void> promise;
-    CallFunctionInValidationInterfaceQueue([&promise] {
-        promise.set_value();
-    });
-    promise.get_future().wait();
+    if (g_signals.CallbacksPending() > 0) {
+        // Block until the validation queue drains
+        std::promise<void> promise;
+        CallFunctionInValidationInterfaceQueue([&promise] {
+            promise.set_value();
+        });
+        promise.get_future().wait();
+    }
 }
 
 void CMainSignals::MempoolEntryRemoved(CTransactionRef ptx, MemPoolRemovalReason reason) {
