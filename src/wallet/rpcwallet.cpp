@@ -3910,6 +3910,8 @@ UniValue signrawtransactionwithwallet(const JSONRPCRequest& request)
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
     }
 
+    pwallet->BlockUntilSyncedToCurrentChain();
+
     // Sign the transaction
     auto locked_chain = pwallet->chain().lock();
     LOCK(pwallet->cs_wallet);

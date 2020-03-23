@@ -197,8 +197,6 @@ void SingleThreadedSchedulerClient::AddToProcessQueue(std::function<void ()> fun
 }
 
 void SingleThreadedSchedulerClient::EmptyQueue() {
-    if (!m_pscheduler->AreThreadsServicingQueue())
-        return;
     auto pendingCallbacks = [this]() -> bool {
         LOCK(m_cs_callbacks_pending);
         return !m_callbacks_pending.empty();

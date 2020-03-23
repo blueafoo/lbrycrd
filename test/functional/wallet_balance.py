@@ -37,6 +37,7 @@ def create_transactions(node, address, amt, fees):
     for fee in fees:
         outputs = {address: amt}
         # prevent 0 change output
+        node.syncwithvalidationinterfacequeue()
         if ins_total > amt + fee:
             outputs[node.getrawchangeaddress()] = ins_total - amt - fee
         raw_tx = node.createrawtransaction(inputs, outputs, 0, True)
@@ -91,15 +92,18 @@ class WalletTest(BitcoinTestFramework):
         assert_equal(self.nodes[0].getbalance(minconf=0, include_watchonly=True), 2)
         assert_equal(self.nodes[1].getbalance(minconf=0, include_watchonly=True), 1)
 
+        self.sync_all()
         # Send 40 BTC from 0 to 1 and 60 BTC from 1 to 0.
         txs = create_transactions(self.nodes[0], self.nodes[1].getnewaddress(), Decimal('0.4'), [Decimal('0.01')])
-        self.nodes[0].sendrawtransaction(txs[0]['hex'])
-        self.nodes[1].sendrawtransaction(txs[0]['hex'])  # sending on both nodes is faster than waiting for propagation
+        tx1 = self.nodes[0].sendrawtransaction(txs[0]['hex'])
+        tx2 = self.nodes[1].sendrawtransaction(txs[0]['hex'])  # sending on both nodes is faster than waiting for propagation
+        assert_equal(tx1, tx2)
 
         self.sync_all()
         txs = create_transactions(self.nodes[1], self.nodes[0].getnewaddress(), Decimal('0.6'), [Decimal('0.01'), Decimal('0.02')])
-        self.nodes[1].sendrawtransaction(txs[0]['hex'])
-        self.nodes[0].sendrawtransaction(txs[0]['hex'])  # sending on both nodes is faster than waiting for propagation
+        tx1 = self.nodes[0].sendrawtransaction(txs[0]['hex'])
+        tx2 = self.nodes[1].sendrawtransaction(txs[0]['hex'])  # sending on both nodes is faster than waiting for propagation
+        assert_equal(tx1, tx2)
         self.sync_all()
 
         # First argument of getbalance must be set to "*"
